@@ -22,7 +22,13 @@ echo ""
 python scripts/train_all.py --data "$DATA" --episodes "$EPISODES"
 echo ""
 
-# Step 3: Start frontend
+# Step 3: Stop-loss sweep
+echo "→ Running stop-loss sweep (0.5% – 5.0%) ..."
+echo ""
+python scripts/sl_sweep.py --data "$DATA"
+echo ""
+
+# Step 4: Start frontend
 echo "═══════════════════════════════════════════════════"
 echo "  Done! Start the dashboard with: pnpm dev"
 echo "  Then open http://localhost:3000"

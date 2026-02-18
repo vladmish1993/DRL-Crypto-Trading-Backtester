@@ -5,12 +5,13 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import Link from "next/link"
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, BarChart, Bar, Legend,
   ReferenceLine, Area, AreaChart
 } from "recharts"
-import { TrendingUp, TrendingDown, DollarSign, Activity, Brain, Target, BarChart3, Zap, RefreshCw } from "lucide-react"
+import { TrendingUp, TrendingDown, DollarSign, Activity, Brain, Target, BarChart3, Zap, RefreshCw, Shield } from "lucide-react"
 
 // ── types ────────────────────────────────────────────────────────
 
@@ -187,14 +188,25 @@ export default function Dashboard() {
               </p>
             </div>
           </div>
-          <Button
-            onClick={fetchResults}
-            variant="outline"
-            size="sm"
-            className="border-slate-700 text-slate-400 hover:text-slate-100 hover:bg-slate-800"
-          >
-            <RefreshCw className="h-4 w-4 mr-1" /> Refresh
-          </Button>
+          <div className="flex gap-2">
+            <Link href="/sweep">
+              <Button
+                variant="outline"
+                size="sm"
+                className="border-slate-700 text-amber-400 hover:text-amber-300 hover:bg-slate-800"
+              >
+                <Shield className="h-4 w-4 mr-1" /> SL Sweep
+              </Button>
+            </Link>
+            <Button
+              onClick={fetchResults}
+              variant="outline"
+              size="sm"
+              className="border-slate-700 text-slate-400 hover:text-slate-100 hover:bg-slate-800"
+            >
+              <RefreshCw className="h-4 w-4 mr-1" /> Refresh
+            </Button>
+          </div>
         </div>
 
         {/* KPI Row */}

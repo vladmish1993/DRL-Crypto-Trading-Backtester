@@ -1,6 +1,7 @@
 numpy
 pandas
-gym
-stable-baselines3
+gymnasium
+torch
+ccxt
 matplotlib
 scikit-learn

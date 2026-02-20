@@ -161,7 +161,7 @@ def buy_and_hold_baseline(test_df, initial=10_000.0) -> dict:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--data',     default='data/SOL_USDT_15m.csv')
+    ap.add_argument('--data',     default='../data/SOL_USDT_15m.csv')
     ap.add_argument('--episodes', type=int, default=50)
     ap.add_argument('--output',   default='results/backtest_results.json')
     ap.add_argument('--skip-train', action='store_true')

@@ -38,6 +38,9 @@ class CryptoFuturesEnv(gym.Env):
             max_position_frac: float = 1.0,  # fraction of equity per trade
             stop_loss_pct: float = 0.0,  # 0 = disabled, e.g. 0.02 = 2%
             take_profit_pct: float = 0.0,  # 0 = disabled, e.g. 0.03 = 3%
+            min_hold_steps: int = 0,  # 0 = disabled, e.g. 16 = 4h on 15m bars
+            cooldown_steps: int = 0,  # 0 = disabled, bars to wait after a trade
+            trade_penalty: float = 0.0,  # reward penalty per trade (fraction of initial_balance)
     ):
         super().__init__()
         self.df = df.reset_index(drop=True)
@@ -48,6 +51,10 @@ class CryptoFuturesEnv(gym.Env):
         self.max_position_frac = max_position_frac
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
+        self.min_hold_steps = int(min_hold_steps)
+        self.cooldown_steps = int(cooldown_steps)
+        self.trade_penalty = float(trade_penalty)
+        self.cooldown = 0
 
         self.action_space = spaces.Discrete(4)
         n_obs = len(self.feature_columns) + 3
@@ -66,6 +73,7 @@ class CryptoFuturesEnv(gym.Env):
         self.entry_step = 0
         self.trades: list[dict] = []
         self.equity_curve = [self.initial_balance]
+        self.cooldown = 0
         return self._obs(), {}
 
     # -------------------------------------------------------------- helpers
@@ -191,29 +199,61 @@ class CryptoFuturesEnv(gym.Env):
         prev_equity = self._equity()
 
         # ── SL / TP fires before agent action ──
-        self._check_sl_tp()
+        sl_tp_closed = self._check_sl_tp()
+        if sl_tp_closed and self.cooldown_steps:
+            # If SL/TP closed intrabar, do not allow discretionary re-entry this same bar
+            self.cooldown = max(self.cooldown, self.cooldown_steps)
 
-        # execute
-        if action == self.LONG and self.position <= 0:
+        trades_this_step = 0
+
+        # Cooldown tick
+        if self.cooldown > 0:
+            self.cooldown -= 1
+
+        # Minimum hold time before a voluntary CLOSE or flip
+        hold_steps = (self.step_idx - self.entry_step) if self.position else 0
+        can_close = (not self.position) or (hold_steps >= self.min_hold_steps)
+        can_trade = (self.cooldown == 0) and (not sl_tp_closed)
+
+        # execute (with anti-churn gates)
+        if action == self.LONG and self.position <= 0 and can_trade:
             if self.position == -1:
-                self._close()
-            self._open(+1)
-        elif action == self.SHORT and self.position >= 0:
+                if can_close:
+                    self._close(); trades_this_step += 1
+                else:
+                    action = self.HOLD
+            if self.position == 0:
+                self._open(+1); trades_this_step += 1
+                self.cooldown = self.cooldown_steps
+
+        elif action == self.SHORT and self.position >= 0 and can_trade:
             if self.position == +1:
-                self._close()
-            self._open(-1)
+                if can_close:
+                    self._close(); trades_this_step += 1
+                else:
+                    action = self.HOLD
+            if self.position == 0:
+                self._open(-1); trades_this_step += 1
+                self.cooldown = self.cooldown_steps
+
         elif action == self.CLOSE and self.position != 0:
-            self._close()
+            if can_close and can_trade:
+                self._close(); trades_this_step += 1
+                self.cooldown = self.cooldown_steps
+            else:
+                action = self.HOLD
 
         self.step_idx += 1
-
-        cur_equity = self._equity()
-        reward = (cur_equity - prev_equity) / self.initial_balance
-        self.equity_curve.append(cur_equity)
 
         done = self.step_idx >= len(self.df) - 1
         if done and self.position:
             self._close()
+            trades_this_step += 1
+
+        cur_equity = self._equity()
+        reward = (cur_equity - prev_equity) / self.initial_balance
+        reward -= self.trade_penalty * trades_this_step
+        self.equity_curve.append(cur_equity)
 
         return self._obs(), reward, done, False, {
             'equity': cur_equity,

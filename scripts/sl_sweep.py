@@ -2,14 +2,18 @@
 """
 Stop-Loss / Take-Profit sweep.
 
-Loads trained models and runs each through a grid of SL levels on the
-test set.  Outputs a JSON matrix for the dashboard heatmap + line charts.
+Loads trained models and runs each through a grid of SL levels on a chosen
+evaluation split (validation by default). Outputs a JSON matrix for the dashboard
+heatmap and line charts.
+
+Important:
+- Use this on validation while you are tuning.
+- Only run on test once, after you have frozen the parameters.
 
 Usage
 -----
-    python scripts/sl_sweep.py                              # SL only, 0.5-5%
-    python scripts/sl_sweep.py --tp 1.0 2.0 3.0 4.0 5.0    # SL × TP grid
-    python scripts/sl_sweep.py --episodes 80 --retrain       # retrain first
+    python scripts/sl_sweep.py --split val --model_tag my_tag
+    python scripts/sl_sweep.py --split val --model_tag my_tag --tp 0.01 0.02 0.03
 """
 import argparse, json, os, sys, time
 import numpy as np
@@ -32,22 +36,26 @@ SL_LEVELS = [0.005, 0.010, 0.015, 0.020, 0.025, 0.030, 0.035, 0.040, 0.045, 0.05
 SL_LABELS = ['0.5%', '1.0%', '1.5%', '2.0%', '2.5%', '3.0%', '3.5%', '4.0%', '4.5%', '5.0%']
 
 
-def load_data(csv_path, train_ratio=0.7):
+def load_data(csv_path, train_ratio=0.6, val_ratio=0.2):
     df = pd.read_csv(csv_path)
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df = add_indicators(df)
     df = normalize_features(df, FEATURES, window=100)
-    split = int(len(df) * train_ratio)
-    return df.iloc[:split].reset_index(drop=True), df.iloc[split:].reset_index(drop=True)
+
+    split1 = int(len(df) * train_ratio)
+    split2 = int(len(df) * (train_ratio + val_ratio))
+    train = df.iloc[:split1].reset_index(drop=True)
+    val   = df.iloc[split1:split2].reset_index(drop=True) if val_ratio > 0 else None
+    test  = df.iloc[split2:].reset_index(drop=True) if val_ratio > 0 else df.iloc[split1:].reset_index(drop=True)
+    return train, val, test
 
 
-def backtest_with_sl(agent, test_df, sl_pct, tp_pct=0.0):
+def backtest_with_sl(agent, df_eval, sl_pct, tp_pct=0.0, env_base_kwargs=None):
     """Run a single backtest with given SL/TP levels."""
-    env = CryptoFuturesEnv(
-        test_df, FEATURES,
-        stop_loss_pct=sl_pct,
-        take_profit_pct=tp_pct,
-    )
+    kw = dict(env_base_kwargs or {})
+    kw.update(dict(stop_loss_pct=sl_pct, take_profit_pct=tp_pct))
+
+    env = CryptoFuturesEnv(df_eval, FEATURES, **kw)
     s, _ = env.reset()
     done = False
     while not done:
@@ -56,26 +64,7 @@ def backtest_with_sl(agent, test_df, sl_pct, tp_pct=0.0):
     return env.get_metrics()
 
 
-def run_sweep(agents, test_df, sl_levels, tp_levels=None):
-    """
-    Run the full sweep grid.
-
-    Returns
-    -------
-    results : dict
-        {
-          "sl_levels": ["0.5%", ...],
-          "tp_levels": ["None"] or ["1.0%", ...],
-          "no_sl_baseline": { "DQN": {...}, ... },
-          "grid": {
-            "DQN": {
-              "0.5%": { "None": { metrics }, "1.0%": { metrics }, ... },
-              ...
-            },
-            ...
-          }
-        }
-    """
+def run_sweep(agents, df_eval, sl_levels, tp_levels=None, env_base_kwargs=None):
     tp_levels = tp_levels or [0.0]
     tp_labels = ['None'] if tp_levels == [0.0] else [f'{t*100:.1f}%' for t in tp_levels]
 
@@ -86,15 +75,15 @@ def run_sweep(agents, test_df, sl_levels, tp_levels=None):
         'grid': {},
     }
 
-    # ── Baseline: no SL/TP ──
+    # Baseline: no SL/TP
     print("Running baselines (no SL/TP) ...")
     for ag in agents:
-        m = backtest_with_sl(ag, test_df, 0.0, 0.0)
+        m = backtest_with_sl(ag, df_eval, 0.0, 0.0, env_base_kwargs=env_base_kwargs)
         m['algorithm'] = ag.name
         results['no_sl_baseline'][ag.name] = m
         print(f"  {ag.name:<15}  return={m['total_return']:>+8.2f}%  sharpe={m['sharpe_ratio']:>6.2f}")
 
-    # ── Grid sweep ──
+    # Grid sweep
     total_runs = len(agents) * len(sl_levels) * len(tp_levels)
     run = 0
     for ag in agents:
@@ -103,7 +92,7 @@ def run_sweep(agents, test_df, sl_levels, tp_levels=None):
             results['grid'][ag.name][sl_label] = {}
             for tp, tp_label in zip(tp_levels, tp_labels):
                 run += 1
-                m = backtest_with_sl(ag, test_df, sl, tp)
+                m = backtest_with_sl(ag, df_eval, sl, tp, env_base_kwargs=env_base_kwargs)
                 m['algorithm'] = ag.name
                 m['sl_pct'] = sl_label
                 m['tp_pct'] = tp_label
@@ -114,7 +103,7 @@ def run_sweep(agents, test_df, sl_levels, tp_levels=None):
                       f"return={m['total_return']:>+8.2f}%  sharpe={m['sharpe_ratio']:>6.2f}  "
                       f"SL_hits={m['sl_hits']}  TP_hits={m['tp_hits']}")
 
-    # ── Best combos per algorithm ──
+    # Best combos per algorithm (by Sharpe)
     results['best_per_algo'] = {}
     for ag_name in results['grid']:
         best_sharpe = -999
@@ -136,36 +125,79 @@ def main():
     ap.add_argument('--output', default='results/sl_sweep_results.json')
     ap.add_argument('--tp', nargs='*', type=float, default=None,
                     help='TP levels as decimals, e.g. --tp 0.01 0.02 0.03')
+    ap.add_argument('--split', choices=['val','test'], default='val')
+    ap.add_argument('--train_ratio', type=float, default=0.6)
+    ap.add_argument('--val_ratio',   type=float, default=0.2)
+
+    # Must match how the model was trained
+    ap.add_argument('--fee',      type=float, default=0.0004)
+    ap.add_argument('--max_pos',  type=float, default=0.2)
+    ap.add_argument('--min_hold', type=int,   default=16)
+    ap.add_argument('--cooldown', type=int,   default=4)
+    ap.add_argument('--trade_penalty', type=float, default=0.0002)
+
+    ap.add_argument('--model_tag', default='')
+    ap.add_argument('--algo', choices=['all','dqn','double_dqn','dueling_dqn','a2c'], default='all')
     args = ap.parse_args()
 
-    _, test_df = load_data(args.data)
+    _, val_df, test_df = load_data(args.data, train_ratio=args.train_ratio, val_ratio=args.val_ratio)
+
+    if args.split == 'val':
+        if val_df is None:
+            raise ValueError("val_ratio is 0, cannot sweep on validation set")
+        df_eval = val_df
+    else:
+        df_eval = test_df
+
     state_dim = len(FEATURES) + 3
     action_dim = 4
 
     hp = dict(lr=1e-4, gamma=0.99,
-              eps_start=0.05, eps_end=0.05, eps_decay=1.0,  # no exploration for eval
+              eps_start=0.05, eps_end=0.05, eps_decay=1.0,
               buffer_size=50_000, batch_size=64, target_update=1000)
 
-    agents = [
+    agents_all = [
         DQNAgent(state_dim, action_dim, **hp),
         DoubleDQNAgent(state_dim, action_dim, **hp),
         DuelingDQNAgent(state_dim, action_dim, **hp),
         A2CAgent(state_dim, action_dim, lr=3e-4, gamma=0.99),
     ]
 
+    if args.algo == 'all':
+        agents = agents_all
+    elif args.algo == 'dqn':
+        agents = [agents_all[0]]
+    elif args.algo == 'double_dqn':
+        agents = [agents_all[1]]
+    elif args.algo == 'dueling_dqn':
+        agents = [agents_all[2]]
+    else:
+        agents = [agents_all[3]]
+
     # Load trained weights
+    if not args.model_tag.strip():
+        raise ValueError("Pass --model_tag to select the trained weights to sweep")
+
     for ag in agents:
-        path = f"models/{ag.name.lower().replace(' ', '_')}.pt"
+        path = os.path.join('models', f"{ag.name.lower().replace(' ', '_')}_{args.model_tag}.pt")
         if os.path.exists(path):
             ag.load(path)
-            print(f"Loaded {ag.name} ← {path}")
+            print(f"Loaded {ag.name} from {path}")
         else:
-            print(f"WARNING: {path} not found — using random weights!")
+            raise FileNotFoundError(f"Model not found: {path}")
 
     tp_levels = args.tp if args.tp else [0.0]
 
+    env_base_kwargs = dict(
+        fee_rate=args.fee,
+        max_position_frac=args.max_pos,
+        min_hold_steps=args.min_hold,
+        cooldown_steps=args.cooldown,
+        trade_penalty=args.trade_penalty,
+    )
+
     print(f"\n{'═'*60}")
-    print(f"  STOP-LOSS SWEEP")
+    print(f"  STOP-LOSS SWEEP ({args.split.upper()})")
     print(f"  SL: {SL_LABELS}")
     if args.tp:
         print(f"  TP: {[f'{t*100:.1f}%' for t in tp_levels]}")
@@ -173,7 +205,7 @@ def main():
     print(f"{'═'*60}\n")
 
     t0 = time.time()
-    results = run_sweep(agents, test_df, SL_LEVELS, tp_levels)
+    results = run_sweep(agents, df_eval, SL_LEVELS, tp_levels, env_base_kwargs=env_base_kwargs)
     elapsed = time.time() - t0
 
     print(f"\n{'═'*60}")
@@ -184,17 +216,10 @@ def main():
               f"sharpe={m['sharpe_ratio']:>6.2f}  return={m['total_return']:>+8.2f}%")
     print(f"\n  Completed in {elapsed:.1f}s")
 
-    # Save
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     with open(args.output, 'w') as f:
         json.dump(results, f, indent=2, default=str)
-    print(f"  Results → {args.output}")
-
-    pub = os.path.join('public', 'sl_sweep_results.json')
-    os.makedirs('public', exist_ok=True)
-    with open(pub, 'w') as f:
-        json.dump(results, f, indent=2, default=str)
-    print(f"  Results → {pub}")
+    print(f"  Results -> {args.output}")
 
 
 if __name__ == '__main__':

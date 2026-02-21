@@ -1,7 +1,4 @@
-numpy
-pandas
-gymnasium
-torch
-ccxt
-matplotlib
-scikit-learn
+gymnasium==1.2.3
+numpy==2.4.2
+pandas==3.0.1
+torch==2.10.0

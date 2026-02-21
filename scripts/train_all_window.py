@@ -236,6 +236,11 @@ def _fmt_time(seconds: float) -> str:
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
+    os.environ['OMP_NUM_THREADS'] = '4'
+    os.environ['MKL_NUM_THREADS'] = '4'
+    os.environ['OPENBLAS_NUM_THREADS'] = '4'
+    os.environ['TORCH_NUM_THREADS'] = '1'
+
     ap = argparse.ArgumentParser()
     ap.add_argument('--data',     default='data/SOL_USDT_15m.csv')
     ap.add_argument('--episodes', type=int, default=200)

@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """
-run_grid.py — Multi-process RL training grid runner.
+run_rl_grid.py — Multi-process RL training grid runner (resume-friendly + per-run logs).
 
-Spawns N parallel training processes across a full parameter grid.
-Resume-friendly: skips runs whose output JSON already exists.
-
-Usage
------
-    # 4 parallel workers (default)
-    python scripts/run_grid.py --workers 4
-
-    # 8 workers on beefy AWS instance
-    python scripts/run_grid.py --workers 8
-
-    # Dry run (print commands, don't execute)
-    python scripts/run_grid.py --dry_run
-
-    # Custom output dir
-    python scripts/run_grid.py --workers 6 --out_dir results/rl_full_grid
+Fixes vs previous version:
+- Uses absolute paths (no working-directory surprises on servers / systemd).
+- Preflight checks for data and train script existence.
+- Writes per-run log files (stdout+stderr) so failures are diagnosable.
+- Grid log keeps short status lines + points you to the per-run log.
+- Resume-friendly: skips runs whose output JSON already exists.
 """
 
 import argparse
@@ -30,13 +20,10 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-
-# ═══════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────
 #  GRID DEFINITION — edit these to change your sweep
-# ═══════════════════════════════════════════════════════════════════
-
+# ─────────────────────────────────────────────────────────────────────
 GRID = dict(
-    # Top 3 screen winners (eps_decay, penalty pairs)
     ed_pen=[
         (0.9999,  0.0004),
         (0.99997, 0.0001),
@@ -54,7 +41,7 @@ FIXED = dict(
     data="data/SOL_USDT_15m.csv",
     train_ratio=0.8,
     val_ratio=0.0,
-    eval="full",
+    eval="test",
     episodes=300,
     algo="dqn",
     fee=0.0004,
@@ -65,97 +52,193 @@ FIXED = dict(
     no_public_copy=True,
 )
 
+RUN_TIMEOUT_S = 7200  # 2h per job
 
-def build_jobs(out_dir: str):
-    """Generate all (tag, cmd, output_path) tuples from the grid."""
+
+def tail_text(path: Path, max_lines: int = 60) -> str:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return "".join(lines[-max_lines:])
+    except Exception:
+        return ""
+
+
+def build_jobs(root: Path, out_dir: Path, train_script: Path, data_path: Path):
     jobs = []
+    log_dir = out_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
 
-    ed_pen_list = GRID['ed_pen']
     for (ed, pen), mh, cd, adx, win, seed in itertools.product(
-        ed_pen_list,
-        GRID['min_hold'],
-        GRID['cooldown'],
-        GRID['adx_threshold'],
-        GRID['window'],
-        GRID['seed'],
+        GRID["ed_pen"],
+        GRID["min_hold"],
+        GRID["cooldown"],
+        GRID["adx_threshold"],
+        GRID["window"],
+        GRID["seed"],
     ):
-        ed_str = str(ed).replace('.', 'p')
-        pen_str = str(pen).replace('.', 'p')
+        ed_str = str(ed).replace(".", "p")
+        pen_str = str(pen).replace(".", "p")
 
         tag = f"g_mh{mh}_cd{cd}_adx{adx}_ed{ed_str}_pen{pen_str}_win{win}_seed{seed}"
-        out_path = os.path.join(out_dir, f"{tag}.json")
+        out_path = out_dir / f"{tag}.json"
+        run_log = log_dir / f"{tag}.log"
 
         cmd = [
-            sys.executable, "scripts/train_all_window.py",
-            "--data", FIXED['data'],
-            "--train_ratio", str(FIXED['train_ratio']),
-            "--val_ratio", str(FIXED['val_ratio']),
-            "--eval", FIXED['eval'],
-            "--episodes", str(FIXED['episodes']),
+            sys.executable, str(train_script),
+            "--data", str(data_path),
+            "--train_ratio", str(FIXED["train_ratio"]),
+            "--val_ratio", str(FIXED["val_ratio"]),
+            "--eval", FIXED["eval"],
+            "--episodes", str(FIXED["episodes"]),
             "--window", str(win),
             "--seed", str(seed),
-            "--algo", FIXED['algo'],
-            "--fee", str(FIXED['fee']),
-            "--max_pos", str(FIXED['max_pos']),
-            "--sl", str(FIXED['sl']),
-            "--tp", str(FIXED['tp']),
+            "--algo", FIXED["algo"],
+            "--fee", str(FIXED["fee"]),
+            "--max_pos", str(FIXED["max_pos"]),
+            "--sl", str(FIXED["sl"]),
+            "--tp", str(FIXED["tp"]),
             "--min_hold", str(mh),
             "--cooldown", str(cd),
             "--trade_penalty", str(pen),
             "--eps_decay", str(ed),
             "--adx_threshold", str(adx),
-            "--log_every", str(FIXED['log_every']),
+            "--log_every", str(FIXED["log_every"]),
             "--model_tag", tag,
-            "--output", out_path,
+            "--output", str(out_path),
         ]
-        if FIXED.get('no_public_copy'):
+        if FIXED.get("no_public_copy"):
             cmd.append("--no_public_copy")
 
-        jobs.append((tag, cmd, out_path))
+        jobs.append((tag, cmd, out_path, run_log))
 
     return jobs
 
 
-def run_one(tag, cmd, out_path):
-    """Run a single training job. Returns (tag, success, elapsed, error_msg)."""
+def run_one(tag: str, cmd: list[str], out_path: str, run_log_path: str):
     t0 = time.time()
+    run_log = Path(run_log_path)
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=7200,  # 2 hour timeout per run
-        )
+        run_log.parent.mkdir(parents=True, exist_ok=True)
+        with run_log.open("a", encoding="utf-8") as lf:
+            lf.write("\n" + "=" * 100 + "\n")
+            lf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] START {tag}\n")
+            lf.write("CMD: " + " ".join(cmd) + "\n\n")
+            lf.flush()
+
+            result = subprocess.run(
+                cmd,
+                stdout=lf,
+                stderr=lf,
+                text=True,
+                timeout=RUN_TIMEOUT_S,
+            )
+
         elapsed = time.time() - t0
 
         if result.returncode != 0:
-            return (tag, False, elapsed, result.stderr[-500:] if result.stderr else "unknown error")
+            hint = tail_text(run_log, 40).strip()
+            if not hint:
+                hint = f"non-zero exit code {result.returncode}"
+            return (tag, False, elapsed, hint, run_log_path)
 
-        return (tag, True, elapsed, "")
+        try:
+            if (not os.path.exists(out_path)) or (os.path.getsize(out_path) == 0):
+                return (tag, False, elapsed, "job exited 0 but output JSON missing/empty", run_log_path)
+        except Exception:
+            pass
+
+        return (tag, True, elapsed, "", run_log_path)
 
     except subprocess.TimeoutExpired:
-        return (tag, False, time.time() - t0, "TIMEOUT (2h)")
+        return (tag, False, time.time() - t0, f"TIMEOUT ({RUN_TIMEOUT_S}s)", run_log_path)
     except Exception as e:
-        return (tag, False, time.time() - t0, str(e))
+        return (tag, False, time.time() - t0, str(e), run_log_path)
+
+
+def _print_summary(out_dir: Path):
+    import glob
+    rows = []
+    for fn in sorted(glob.glob(str(out_dir / "g_*.json"))):
+        tag = Path(fn).stem
+        try:
+            with open(fn, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+
+        for split_name in ("test", "full"):
+            d = data.get(split_name, data)
+            if not isinstance(d, dict):
+                continue
+            for algo, m in d.items():
+                if algo == "Buy & Hold" or not isinstance(m, dict):
+                    continue
+                rows.append({
+                    "tag": tag,
+                    "split": split_name,
+                    "algo": algo,
+                    "sharpe": m.get("sharpe_ratio", 0),
+                    "ret": m.get("total_return", 0),
+                    "dd": m.get("max_drawdown", 0),
+                    "trades": m.get("total_trades", 0),
+                    "wr": m.get("win_rate", 0),
+                })
+
+    if not rows:
+        print("No results found yet.")
+        return
+
+    def show(split: str):
+        srows = [r for r in rows if r["split"] == split]
+        if not srows:
+            return
+        srows = sorted(srows, key=lambda r: -float(r["sharpe"]))
+        print(f"\n{'='*88}")
+        print(f" TOP 20 {split.upper()} RESULTS ({len(srows)} rows incl algos)")
+        print(f"{'='*88}")
+        print(f"{'Rank':<5} {'Sharpe':>7} {'Ret%':>8} {'DD%':>6} {'Trades':>6} {'WR%':>6}  Algo  Tag")
+        for i, r in enumerate(srows[:20], 1):
+            print(f"{i:<5} {float(r['sharpe']):>+7.2f} {float(r['ret']):>+8.2f} {float(r['dd']):>5.1f}% "
+                  f"{int(r['trades']):>6} {float(r['wr']):>5.1f}%  {r['algo']:<4}  {r['tag']}")
+
+    show("test")
+    show("full")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Multi-process RL training grid")
-    ap.add_argument('--workers', type=int, default=4, help='Number of parallel training processes')
-    ap.add_argument('--out_dir', default='results/rl_full_grid', help='Output directory for JSON results')
-    ap.add_argument('--dry_run', action='store_true', help='Print jobs without running')
-    ap.add_argument('--log', default='results/rl_full_grid/grid_log.txt', help='Log file path')
+    ap = argparse.ArgumentParser(description="Multi-process RL training grid (resume-friendly)")
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--out_dir", default="results/rl_full_grid")
+    ap.add_argument("--dry_run", action="store_true")
+    ap.add_argument("--log", default=None)
+    ap.add_argument("--data", default=None, help="Override data csv path (absolute or relative to repo root)")
+    ap.add_argument("--train_script", default=None, help="Override train script path")
     args = ap.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    root = Path(__file__).resolve().parents[1]
+    out_dir = (root / args.out_dir).resolve() if not os.path.isabs(args.out_dir) else Path(args.out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build all jobs
-    all_jobs = build_jobs(args.out_dir)
+    log_path = Path(args.log) if args.log else (out_dir / "grid_log.txt")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    train_script = Path(args.train_script).resolve() if args.train_script else (root / "scripts" / "train_all_window.py")
+    data_path = Path(args.data).resolve() if args.data else (root / FIXED["data"])
+
+    if not train_script.exists():
+        print(f"ERROR: train script not found: {train_script}")
+        sys.exit(2)
+    if not data_path.exists():
+        print(f"ERROR: data file not found: {data_path}")
+        print("Tip: copy your CSV to data/ on the server, or pass --data /absolute/path/to.csv")
+        sys.exit(2)
+
+    all_jobs = build_jobs(root, out_dir, train_script, data_path)
     total = len(all_jobs)
     print(f"Grid total: {total} runs")
 
-    # Filter out already-completed jobs (resume)
-    pending = [(tag, cmd, out) for tag, cmd, out in all_jobs if not os.path.exists(out)]
+    pending = [(tag, cmd, out, run_log) for tag, cmd, out, run_log in all_jobs if not out.exists()]
     skipped = total - len(pending)
     if skipped:
         print(f"Skipping {skipped} completed runs (resume)")
@@ -163,118 +246,57 @@ def main():
 
     if args.dry_run:
         print("\n--- DRY RUN (first 5 commands) ---")
-        for tag, cmd, out in pending[:5]:
+        for tag, cmd, out, run_log in pending[:5]:
             print(f"\n  {tag}")
             print(f"  {' '.join(cmd)}")
-        print(f"\n... and {max(0, len(pending)-5)} more")
+            print(f"  out: {out}")
+            print(f"  log: {run_log}")
         return
 
     if not pending:
         print("Nothing to do — all runs complete!")
-        _print_summary(args.out_dir)
+        _print_summary(out_dir)
         return
 
-    # Open log file
-    log_path = args.log
-    os.makedirs(os.path.dirname(log_path) or '.', exist_ok=True)
-    log_f = open(log_path, 'a')
-
-    def log(msg):
-        ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    def grid_log(msg: str):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {msg}"
         print(line)
-        log_f.write(line + '\n')
-        log_f.flush()
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
-    log(f"Starting grid: {len(pending)} pending / {total} total / {args.workers} workers")
+    grid_log(f"Starting grid: {len(pending)} pending / {total} total / {args.workers} workers")
     t_start = time.time()
     done = 0
     failed = 0
 
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = {}
-        for tag, cmd, out in pending:
-            f = pool.submit(run_one, tag, cmd, out)
+        for tag, cmd, out, run_log in pending:
+            f = pool.submit(run_one, tag, cmd, str(out), str(run_log))
             futures[f] = tag
 
         for f in as_completed(futures):
-            tag, success, elapsed, err = f.result()
+            tag, success, elapsed, hint, run_log_path = f.result()
             done += 1
 
             if success:
-                log(f"[{done}/{len(pending)}] OK  {tag}  ({elapsed:.0f}s)")
+                grid_log(f"[{done}/{len(pending)}] OK  {tag}  ({elapsed:.0f}s)")
             else:
                 failed += 1
-                log(f"[{done}/{len(pending)}] FAIL {tag}  ({elapsed:.0f}s)  {err[:200]}")
+                grid_log(f"[{done}/{len(pending)}] FAIL {tag}  ({elapsed:.0f}s)  log={run_log_path}")
+                if hint:
+                    grid_log(f"  tail: {hint.splitlines()[-1][:240]}")
 
-            # ETA
             avg_per_job = (time.time() - t_start) / done
             remaining = len(pending) - done
             eta_s = avg_per_job * remaining / max(1, args.workers)
-            eta_h = eta_s / 3600
-            log(f"  ETA: {eta_h:.1f}h remaining ({remaining} jobs)")
+            grid_log(f"  ETA: {eta_s/3600:.2f}h remaining ({remaining} jobs)")
 
     total_time = time.time() - t_start
-    log(f"\nGrid complete: {done} runs in {total_time/3600:.1f}h ({failed} failures)")
-    log_f.close()
-
-    _print_summary(args.out_dir)
+    grid_log(f"\nGrid complete: {done} runs in {total_time/3600:.2f}h ({failed} failures)")
+    _print_summary(out_dir)
 
 
-def _print_summary(out_dir: str):
-    """Print a quick leaderboard from completed JSONs."""
-    import glob
-
-    rows = []
-    for fn in sorted(glob.glob(os.path.join(out_dir, 'g_*.json'))):
-        tag = os.path.basename(fn).replace('.json', '')
-        try:
-            with open(fn) as f:
-                data = json.load(f)
-        except Exception:
-            continue
-
-        for split_name in ('test', 'full'):
-            d = data.get(split_name, data)
-            for algo, m in d.items():
-                if algo == 'Buy & Hold':
-                    continue
-                if not isinstance(m, dict):
-                    continue
-                rows.append({
-                    'tag': tag, 'split': split_name,
-                    'sharpe': m.get('sharpe_ratio', 0),
-                    'ret': m.get('total_return', 0),
-                    'dd': m.get('max_drawdown', 0),
-                    'trades': m.get('total_trades', 0),
-                    'wr': m.get('win_rate', 0),
-                })
-
-    if not rows:
-        print("No results found yet.")
-        return
-
-    # Top 20 TEST
-    test_rows = sorted([r for r in rows if r['split'] == 'test'], key=lambda r: -r['sharpe'])
-    print(f"\n{'='*80}")
-    print(f"  TOP 20 TEST RESULTS ({len(test_rows)} total)")
-    print(f"{'='*80}")
-    print(f"{'Rank':<5} {'Sharpe':>7} {'Ret%':>8} {'DD%':>6} {'Trades':>6} {'WR%':>5}  Tag")
-    for i, r in enumerate(test_rows[:20], 1):
-        print(f"{i:<5} {r['sharpe']:>+7.2f} {r['ret']:>+8.2f} {r['dd']:>5.1f}% {r['trades']:>6} {r['wr']:>5.1f}  {r['tag']}")
-
-    # Top 20 FULL
-    full_rows = sorted([r for r in rows if r['split'] == 'full'], key=lambda r: -r['sharpe'])
-    print(f"\n{'='*80}")
-    print(f"  TOP 20 FULL RESULTS ({len(full_rows)} total)")
-    print(f"{'='*80}")
-    print(f"{'Rank':<5} {'Sharpe':>7} {'Ret%':>8} {'DD%':>6} {'Trades':>6} {'WR%':>5}  Tag")
-    for i, r in enumerate(full_rows[:20], 1):
-        print(f"{i:<5} {r['sharpe']:>+7.2f} {r['ret']:>+8.2f} {r['dd']:>5.1f}% {r['trades']:>6} {r['wr']:>5.1f}  {r['tag']}")
-
-    print(f"\nRule baseline (OOS): Sharpe +1.25, Return +1.60%, DD 1.92%, Trades 22")
-    print(f"Current best DQN (OOS): Sharpe +1.97, Return +3.67%, DD 2.01%, Trades 125")
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

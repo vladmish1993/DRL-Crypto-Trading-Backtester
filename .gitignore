@@ -22,7 +22,7 @@ yarn-error.log*
 
 # env files
 .env*
-
+.csv*
 .pyc*
 
 # vercel

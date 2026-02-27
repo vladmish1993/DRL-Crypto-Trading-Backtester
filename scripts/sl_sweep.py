@@ -28,7 +28,7 @@ from models import DQNAgent, DoubleDQNAgent, DuelingDQNAgent, A2CAgent
 FEATURES = [
     'close_norm', 'open_norm', 'high_norm', 'low_norm',
     'sma_20_norm', 'sma_50_norm',
-    'rsi_norm', 'macd_norm', 'macd_signal_norm', 'macd_hist_norm',
+    'rsi_norm', 'adx_norm', 'macd_norm', 'macd_signal_norm', 'macd_hist_norm',
     'bb_width_norm', 'atr_norm', 'volume_ratio_norm', 'returns',
 ]
 

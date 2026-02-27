@@ -1,10 +1,10 @@
 """
-Fetch SOL/USDT 15m futures data from Binance using ccxt.
+Fetch SOL/USDT 1m futures data from Binance using ccxt.
 Run this script once to download historical data to data/ directory.
 
 Usage:
     python scripts/fetch_data.py
-    python scripts/fetch_data.py --symbol SOL/USDT --timeframe 15m --start 2023-06-01
+    python scripts/fetch_data.py --symbol SOL/USDT --timeframe 1m --start 2023-06-01
 """
 import ccxt
 import pandas as pd
@@ -14,7 +14,7 @@ import argparse
 from datetime import datetime
 
 
-def fetch_binance_futures(symbol='SOL/USDT', timeframe='15m',
+def fetch_binance_futures(symbol='SOL/USDT', timeframe='1m',
                           start_date='2023-06-01', end_date=None,
                           output_dir='data'):
     """
@@ -74,7 +74,7 @@ def fetch_binance_futures(symbol='SOL/USDT', timeframe='15m',
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Download Binance Futures OHLCV data')
     parser.add_argument('--symbol', default='SOL/USDT')
-    parser.add_argument('--timeframe', default='15m')
+    parser.add_argument('--timeframe', default='1m')
     parser.add_argument('--start', default='2023-06-01')
     parser.add_argument('--end', default=None)
     parser.add_argument('--output', default='data')

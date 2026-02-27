@@ -138,6 +138,7 @@ def run_one(job: dict) -> dict:
         slope_threshold=job['slope_threshold'],
         sma_period=job['sma_period'],
         allow_short=job['allow_short'],
+        adx_threshold=job.get('adx_threshold', 0.0),
     )
 
     env = EnvParams(
@@ -222,14 +223,33 @@ def run_one(job: dict) -> dict:
                        'max_dd_max': m.get('max_drawdown', 0.0), 'trades_mean': m.get('total_trades', 0)}
 
     run_s = time.time() - t0
+    # --- scoring
+    if job.get('eval_mode', 'full') == 'random_windows':
+        agg = job.get('_agg', {})
+        # Tail-robust Sharpe: blend median + p10 so we optimise for typical AND bad windows.
+        s_med = float(agg.get('sharpe_median', float(m.get('sharpe_ratio', 0.0))))
+        s_p10 = float(agg.get('sharpe_p10', s_med))
+        sharpe_for_score = 0.6 * s_med + 0.4 * s_p10
 
-    score = composite_score(
-        float(m.get('sharpe_ratio', 0.0)),
-        float(m.get('max_drawdown', 0.0)),
-        int(m.get('total_trades', 0)),
-        dd_penalty=job['dd_penalty'],
-        trade_bonus=job['trade_bonus'],
-    )
+        max_dd_for_score = float(agg.get('max_dd_max', float(m.get('max_drawdown', 0.0))))
+        trades_for_score = float(agg.get('trades_mean', float(m.get('total_trades', 0))))
+
+        score = composite_score(
+            float(sharpe_for_score),
+            float(max_dd_for_score),
+            int(round(trades_for_score)),
+            dd_penalty=job['dd_penalty'],
+            trade_bonus=job['trade_bonus'],
+            min_trades_floor=1,
+        )
+    else:
+        score = composite_score(
+            float(m.get('sharpe_ratio', 0.0)),
+            float(m.get('max_drawdown', 0.0)),
+            int(m.get('total_trades', 0)),
+            dd_penalty=job['dd_penalty'],
+            trade_bonus=job['trade_bonus'],
+        )
 
     dd_for_pass = job.get('_agg', {}).get('max_dd_max', float(m.get('max_drawdown', 0.0))) if job.get('eval_mode','full')=='random_windows' else float(m.get('max_drawdown', 0.0))
     trades_for_pass = job.get('_agg', {}).get('trades_mean', float(m.get('total_trades', 0))) if job.get('eval_mode','full')=='random_windows' else float(m.get('total_trades', 0))
@@ -256,6 +276,7 @@ def run_one(job: dict) -> dict:
             'initial_balance': job['initial_balance'],
         },
         'metrics': m,
+        'robust_metrics': job.get('_agg', {}),
         'composite_score': round(float(score), 6),
         'passes_constraints': int(passes),
         'run_seconds': round(float(run_s), 4),
@@ -278,6 +299,7 @@ def run_one(job: dict) -> dict:
         'slope_threshold': job['slope_threshold'],
         'sma_period': job['sma_period'],
         'allow_short': int(job['allow_short']),
+        'adx_threshold': job.get('adx_threshold', 0.0),
         'sl': job['sl'],
         'tp': job['tp'],
         'max_pos': job['max_pos'],
@@ -306,7 +328,7 @@ FIELDNAMES = [
     'timestamp',
     'config_key',
     'split',
-    'rsi_entry', 'rsi_exit', 'trend_lookback', 'slope_threshold', 'sma_period', 'allow_short',
+    'rsi_entry', 'rsi_exit', 'trend_lookback', 'slope_threshold', 'sma_period', 'allow_short', 'adx_threshold',
     'sl', 'tp', 'max_pos', 'min_hold', 'cooldown', 'fee',
     'val_return', 'val_sharpe', 'val_sharpe_median', 'val_sharpe_p10', 'val_max_dd', 'val_max_dd_max', 'val_trades', 'val_trades_mean', 'val_win_rate',
     'sl_hits', 'tp_hits',
@@ -379,6 +401,9 @@ def main():
     ap.add_argument('--seed', type=int, default=123, help='Base seed for window sampling (deterministic)')
     ap.add_argument('--warmup', type=int, default=0, help='Optional warmup bars inside each sampled window that are ignored for scoring')
 
+    ap.add_argument('--from_csv', default='', help='Optional: load candidate configs from an existing rule_sweep CSV (Stage A).')
+    ap.add_argument('--top_k', type=int, default=0, help='When using --from_csv, evaluate only the top K rows (by composite_score). 0 = all.')
+
     # Strategy grids
     ap.add_argument('--rsi_entry', nargs='+', type=float, default=[20, 25, 30, 35])
     ap.add_argument('--rsi_exit', nargs='+', type=float, default=[65, 70, 75, 80])
@@ -386,6 +411,8 @@ def main():
     ap.add_argument('--sma_period', nargs='+', type=int, default=[0, 50, 100, 200])
     ap.add_argument('--slope_threshold', type=float, default=0.0)
     ap.add_argument('--allow_short', action='store_true')
+    ap.add_argument('--adx_threshold', nargs='+', type=float, default=[0.0],
+                    help='Entry-only regime filter: only take entries when ADX <= threshold. 0 disables.')
 
     # Execution grids
     ap.add_argument('--sl', nargs='+', type=float, default=[0.0, 0.005, 0.01, 0.02, 0.03])
@@ -421,70 +448,136 @@ def main():
 
 
     # Build grid
-    grid = list(itertools.product(
-        args.rsi_entry,
-        args.rsi_exit,
-        args.trend_lookback,
-        args.sma_period,
-        args.sl,
-        args.tp,
-        args.max_pos,
-        args.min_hold,
-        args.cooldown,
-    ))
-
     jobs = []
     skipped = 0
-    for (re, rx, lb, sma, sl, tp, mp, mh, cd) in grid:
-        if lb < 2:
-            continue
 
-        config_key = (
-            f"re{fmt_tag(re)}_rx{fmt_tag(rx)}_lb{lb}_sma{sma}_"
-            f"sl{fmt_tag(sl)}_tp{fmt_tag(tp)}_mp{fmt_tag(mp)}_"
-            f"mh{mh}_cd{cd}_sh{int(args.allow_short)}"
-        )
+    if args.from_csv:
+        import pandas as _pd
+        cand = _pd.read_csv(args.from_csv)
+        if 'passes_constraints' in cand.columns:
+            cand = cand[cand['passes_constraints'] == 1]
+        if 'composite_score' in cand.columns:
+            cand = cand.sort_values('composite_score', ascending=False)
+        if args.top_k and args.top_k > 0:
+            cand = cand.head(int(args.top_k))
 
-        out_json = os.path.join(args.out_dir, f"{config_key}.json")
-        if resume and (config_key in completed) and (args.no_json or os.path.exists(out_json)):
-            skipped += 1
-            continue
+        for _, row in cand.iterrows():
+            for adx_thr in args.adx_threshold:
+                base_key = str(row.get('config_key', '')).strip()
+                if not base_key:
+                    continue
+                # Keep base key when adx_thr==0 so you can compare directly to old runs / resume.
+                config_key = base_key if float(adx_thr) <= 0 else (base_key + f"_adx{fmt_tag(float(adx_thr))}")
 
-        jobs.append({
-            'data': args.data,
-            'split': args.split,
-            'train_ratio': args.train_ratio,
-            'val_ratio': args.val_ratio,
-            'out_dir': args.out_dir,
-            'config_key': config_key,
+                out_json = os.path.join(args.out_dir, f"{config_key}.json")
+                if resume and (config_key in completed) and (args.no_json or os.path.exists(out_json)):
+                    skipped += 1
+                    continue
 
-            'rsi_entry': float(re),
-            'rsi_exit': float(rx),
-            'trend_lookback': int(lb),
-            'sma_period': int(sma),
-            'slope_threshold': float(args.slope_threshold),
-            'allow_short': bool(args.allow_short),
+                jobs.append({
+                    'data': args.data,
+                    'split': args.split,
+                    'train_ratio': args.train_ratio,
+                    'val_ratio': args.val_ratio,
+                    'out_dir': args.out_dir,
+                    'config_key': config_key,
 
-            'sl': float(sl),
-            'tp': float(tp),
-            'max_pos': float(mp),
-            'min_hold': int(mh),
-            'cooldown': int(cd),
-            'fee': float(args.fee),
-            'initial_balance': float(args.initial_balance),
-            'leverage': int(args.leverage),
+                    'rsi_entry': float(row.get('rsi_entry', 30.0)),
+                    'rsi_exit': float(row.get('rsi_exit', 70.0)),
+                    'trend_lookback': int(row.get('trend_lookback', 5)),
+                    'sma_period': int(row.get('sma_period', 50)),
+                    'slope_threshold': float(row.get('slope_threshold', args.slope_threshold)),
+                    'allow_short': bool(int(row.get('allow_short', 0))),
+                    'adx_threshold': float(adx_thr),
 
-            'max_dd': float(args.max_dd),
-            'min_trades': int(args.min_trades),
-            'dd_penalty': float(args.dd_penalty),
-            'trade_bonus': float(args.trade_bonus),
-            'no_json': bool(args.no_json),
-            'eval_mode': str(args.eval_mode),
-            'window': int(args.window),
-            'n_windows': int(args.n_windows),
-            'seed': int(args.seed),
-            'warmup': int(args.warmup),
-        })
+                    'sl': float(row.get('sl', 0.0)),
+                    'tp': float(row.get('tp', 0.0)),
+                    'max_pos': float(row.get('max_pos', 0.10)),
+                    'min_hold': int(row.get('min_hold', 16)),
+                    'cooldown': int(row.get('cooldown', 0)),
+
+                    'fee': float(row.get('fee', args.fee)),
+                    'initial_balance': float(args.initial_balance),
+                    'leverage': int(args.leverage),
+
+                    'max_dd': float(args.max_dd),
+                    'min_trades': int(args.min_trades),
+                    'dd_penalty': float(args.dd_penalty),
+                    'trade_bonus': float(args.trade_bonus),
+                    'no_json': bool(args.no_json),
+                    'eval_mode': str(args.eval_mode),
+                    'window': int(args.window),
+                    'n_windows': int(args.n_windows),
+                    'seed': int(args.seed),
+                    'warmup': int(args.warmup),
+                })
+
+    else:
+        grid = list(itertools.product(
+            args.rsi_entry,
+            args.rsi_exit,
+            args.trend_lookback,
+            args.sma_period,
+            args.adx_threshold,
+            args.sl,
+            args.tp,
+            args.max_pos,
+            args.min_hold,
+            args.cooldown,
+        ))
+
+        for (re, rx, lb, sma, adx_thr, sl, tp, mp, mh, cd) in grid:
+            if lb < 2:
+                continue
+
+            base_key = (
+                f"re{fmt_tag(re)}_rx{fmt_tag(rx)}_lb{lb}_sma{sma}_"
+                f"sl{fmt_tag(sl)}_tp{fmt_tag(tp)}_mp{fmt_tag(mp)}_"
+                f"mh{mh}_cd{cd}_sh{int(args.allow_short)}"
+            )
+            config_key = base_key if float(adx_thr) <= 0 else (base_key + f"_adx{fmt_tag(float(adx_thr))}")
+
+            out_json = os.path.join(args.out_dir, f"{config_key}.json")
+            if resume and (config_key in completed) and (args.no_json or os.path.exists(out_json)):
+                skipped += 1
+                continue
+
+            jobs.append({
+                'data': args.data,
+                'split': args.split,
+                'train_ratio': args.train_ratio,
+                'val_ratio': args.val_ratio,
+                'out_dir': args.out_dir,
+                'config_key': config_key,
+
+                'rsi_entry': float(re),
+                'rsi_exit': float(rx),
+                'trend_lookback': int(lb),
+                'sma_period': int(sma),
+                'slope_threshold': float(args.slope_threshold),
+                'allow_short': bool(args.allow_short),
+                'adx_threshold': float(adx_thr),
+
+                'sl': float(sl),
+                'tp': float(tp),
+                'max_pos': float(mp),
+                'min_hold': int(mh),
+                'cooldown': int(cd),
+                'fee': float(args.fee),
+                'initial_balance': float(args.initial_balance),
+                'leverage': int(args.leverage),
+
+                'max_dd': float(args.max_dd),
+                'min_trades': int(args.min_trades),
+                'dd_penalty': float(args.dd_penalty),
+                'trade_bonus': float(args.trade_bonus),
+                'no_json': bool(args.no_json),
+                'eval_mode': str(args.eval_mode),
+                'window': int(args.window),
+                'n_windows': int(args.n_windows),
+                'seed': int(args.seed),
+                'warmup': int(args.warmup),
+            })
 
     total_runs = len(jobs)
     if total_runs == 0 and skipped > 0:

@@ -28,7 +28,7 @@ from models import DQNAgent, DoubleDQNAgent, DuelingDQNAgent, A2CAgent
 FEATURES = [
     'close_norm', 'open_norm', 'high_norm', 'low_norm',
     'sma_20_norm', 'sma_50_norm',
-    'rsi_norm', 'macd_norm', 'macd_signal_norm', 'macd_hist_norm',
+    'rsi_norm', 'adx_norm', 'macd_norm', 'macd_signal_norm', 'macd_hist_norm',
     'bb_width_norm', 'atr_norm', 'volume_ratio_norm', 'returns',
 ]
 
@@ -253,7 +253,7 @@ def main():
     ap.add_argument('--train_ratio', type=float, default=0.6)
     ap.add_argument('--val_ratio',   type=float, default=0.2)
     ap.add_argument('--algo', choices=['all','dqn','double_dqn','dueling_dqn','a2c'], default='all')
-    ap.add_argument('--eval', choices=['val','test','both'], default='test')
+    ap.add_argument('--eval', choices=['val','test','both','full'], default='test')
     ap.add_argument('--fee',      type=float, default=0.0004)
     ap.add_argument('--max_pos',  type=float, default=0.2)
     ap.add_argument('--sl',       type=float, default=0.0)
@@ -261,6 +261,8 @@ def main():
     ap.add_argument('--min_hold', type=int,   default=16)
     ap.add_argument('--cooldown', type=int,   default=4)
     ap.add_argument('--trade_penalty', type=float, default=0.0002)
+    ap.add_argument('--adx_threshold', type=float, default=0.0,
+                    help='0=disabled; if >0, only OPEN trades when ADX <= threshold (rule-style regime gate)')
     ap.add_argument('--lr',        type=float, default=1e-4,
                     help='Learning rate for all agents')
     ap.add_argument('--eps_decay', type=float, default=0.99997,
@@ -287,12 +289,13 @@ def main():
         min_hold_steps=args.min_hold,
         cooldown_steps=args.cooldown,
         trade_penalty=args.trade_penalty,
+        adx_threshold=args.adx_threshold,
     )
 
     run_tag = (
         f"seed{args.seed}_fee{_fmt_tag(args.fee)}_mp{_fmt_tag(args.max_pos)}"
         f"_sl{_fmt_tag(args.sl)}_tp{_fmt_tag(args.tp)}"
-        f"_mh{_fmt_tag(args.min_hold)}_cd{_fmt_tag(args.cooldown)}_p{_fmt_tag(args.trade_penalty)}"
+        f"_mh{_fmt_tag(args.min_hold)}_cd{_fmt_tag(args.cooldown)}_p{_fmt_tag(args.trade_penalty)}_adx{_fmt_tag(args.adx_threshold)}"
     )
     model_tag = args.model_tag.strip() or run_tag
 
@@ -347,18 +350,23 @@ def main():
                 print(f"WARNING: {path} not found - backtest will use random weights")
 
     # ── Backtest ─────────────────────────────────────────────────
-    if args.eval == 'test':
-        print(f"\n{'═'*60}\n  BACKTEST RESULTS (TEST)\n{'═'*60}")
+    if args.eval == 'full':
+        # Rebuild full dataset for complete picture
+        df_full = pd.concat([train_df] + ([val_df] if val_df is not None else []) + [test_df], ignore_index=True)
+        print(f"\n{'═' * 60}\n  BACKTEST RESULTS (TEST + FULL)\n{'═' * 60}")
+        eval_sets = [('test', test_df), ('full', df_full)]
+    elif args.eval == 'test':
+        print(f"\n{'═' * 60}\n  BACKTEST RESULTS (TEST)\n{'═' * 60}")
         eval_sets = [('test', test_df)]
     elif args.eval == 'val':
         if val_df is None:
             raise ValueError("val_ratio is 0, cannot evaluate on validation set")
-        print(f"\n{'═'*60}\n  BACKTEST RESULTS (VAL)\n{'═'*60}")
+        print(f"\n{'═' * 60}\n  BACKTEST RESULTS (VAL)\n{'═' * 60}")
         eval_sets = [('val', val_df)]
     else:
         if val_df is None:
             raise ValueError("val_ratio is 0, cannot evaluate on validation set")
-        print(f"\n{'═'*60}\n  BACKTEST RESULTS (VAL + TEST)\n{'═'*60}")
+        print(f"\n{'═' * 60}\n  BACKTEST RESULTS (VAL + TEST)\n{'═' * 60}")
         eval_sets = [('val', val_df), ('test', test_df)]
 
     results = {}

@@ -39,7 +39,7 @@ from indicators import add_indicators, normalize_features
 FEATURES = [
     'close_norm', 'open_norm', 'high_norm', 'low_norm',
     'sma_20_norm', 'sma_50_norm',
-    'rsi_norm', 'macd_norm', 'macd_signal_norm', 'macd_hist_norm',
+    'rsi_norm', 'adx_norm', 'macd_norm', 'macd_signal_norm', 'macd_hist_norm',
     'bb_width_norm', 'atr_norm', 'volume_ratio_norm', 'returns',
 ]
 
@@ -89,6 +89,7 @@ class StrategyParams:
     slope_threshold: float = 0.0
     sma_period: int = 50  # 0 disables
     allow_short: bool = False
+    adx_threshold: float = 0.0  # 0 disables (only take entries when ADX <= threshold)
 
 
 @dataclass(frozen=True)
@@ -374,6 +375,7 @@ class RsiTrendStrategy:
 
         # Pre-extract numpy arrays for fast access
         self._rsis = df['rsi'].values.astype(np.float64) if 'rsi' in df.columns else None
+        self._adxs = df['adx'].values.astype(np.float64) if 'adx' in df.columns else None
         self._closes = df['close'].values.astype(np.float64)
         if int(params.sma_period) > 0 and self.sma_col in df.columns:
             self._smas = df[self.sma_col].values.astype(np.float64)
@@ -442,14 +444,24 @@ class RsiTrendStrategy:
                 return bt.CLOSE
             return bt.HOLD
 
+        # ADX regime filter (entry-only): if enabled, only trade when ADX is below threshold.
+        adx_ok = True
+        adx_thr = float(getattr(self.p, 'adx_threshold', 0.0) or 0.0)
+        if adx_thr > 0:
+            if self._adxs is None:
+                adx_ok = False  # requested but missing data -> be conservative
+            else:
+                adx = self._adxs[idx]
+                adx_ok = bool(np.isfinite(adx) and (adx <= adx_thr))
+
         # entry signals (flat)
         if bt.position == 0:
-            if (rsi <= self.p.rsi_entry) and (slope > slope_thr) and trend_ok_long:
+            if (rsi <= self.p.rsi_entry) and (slope > slope_thr) and trend_ok_long and adx_ok:
                 return bt.LONG
 
             if self.p.allow_short:
                 short_entry_rsi = 100.0 - float(self.p.rsi_entry)
-                if (rsi >= short_entry_rsi) and (slope < -slope_thr) and trend_ok_short:
+                if (rsi >= short_entry_rsi) and (slope < -slope_thr) and trend_ok_short and adx_ok:
                     return bt.SHORT
 
         return bt.HOLD
@@ -513,7 +525,7 @@ def run_rule_backtest(df_eval: pd.DataFrame, strat: StrategyParams, env: EnvPara
         eq = bt.equity_curve
         step = max(1, len(eq) // 2000)
         m['equity_curve'] = [round(float(eq[i]), 2) for i in range(0, len(eq), step)]
-        m['trades'] = bt.trades[-50:]
+        m['trades'] = bt.trades
     return m
 
 

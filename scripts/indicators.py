@@ -1,7 +1,12 @@
 """
 Technical indicators for trading feature engineering.
 All indicators are computed without lookahead bias.
+
+Notes
+- Indicators are computed using only past/current information (no lookahead).
+- We drop warm-up rows with NaNs at the end of add_indicators().
 """
+
 import numpy as np
 import pandas as pd
 
@@ -40,13 +45,39 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['bb_lower'] = bb_mid - 2 * bb_std
     df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / bb_mid
 
-    # ── ATR (Average True Range) ─────────────────────────────────
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs(),
-    ], axis=1).max(axis=1)
+    # ── True Range / ATR ─────────────────────────────────────────
+    tr = pd.concat(
+        [
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    # Simple ATR (rolling mean). Kept for backwards-compat with existing results.
     df['atr'] = tr.rolling(14).mean()
+
+    # ── ADX (Average Directional Index) ───────────────────────────
+    # Classic Wilder's smoothing via EMA(alpha=1/n).
+    n = 14
+    up_move = high.diff()
+    down_move = -low.diff()  # prev_low - low
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr_w = tr.ewm(alpha=1 / n, adjust=False).mean()
+    plus_dm_w = pd.Series(plus_dm, index=df.index).ewm(alpha=1 / n, adjust=False).mean()
+    minus_dm_w = pd.Series(minus_dm, index=df.index).ewm(alpha=1 / n, adjust=False).mean()
+
+    tr_w_safe = tr_w.replace(0, np.nan)
+    plus_di = 100.0 * (plus_dm_w / tr_w_safe)
+    minus_di = 100.0 * (minus_dm_w / tr_w_safe)
+
+    di_sum = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / di_sum
+    df['adx'] = dx.ewm(alpha=1 / n, adjust=False).mean()
 
     # ── Volume features ──────────────────────────────────────────
     df['volume_sma'] = volume.rolling(20).mean()
@@ -61,18 +92,20 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def normalize_features(df: pd.DataFrame, feature_cols: list,
-                       window: int = 100) -> pd.DataFrame:
+def normalize_features(df: pd.DataFrame, feature_cols: list, window: int = 100) -> pd.DataFrame:
     """
     Rolling z-score normalisation (avoids lookahead bias).
-    Price-based columns get rolling normalisation;
-    bounded columns (rsi, volume_ratio, bb_width) get simpler scaling.
+
+    Price-based / unbounded columns get rolling z-score normalisation.
+    Bounded columns (e.g. RSI/ADX) get simple scaling to [0, 1] ranges.
     """
     df = df.copy()
 
     rolling_norm_cols = [
         'open', 'high', 'low', 'close',
-        'sma_20', 'sma_50', 'macd', 'macd_signal', 'macd_hist', 'atr',
+        'sma_20', 'sma_50',
+        'macd', 'macd_signal', 'macd_hist',
+        'atr',
     ]
 
     for col in rolling_norm_cols:
@@ -81,13 +114,16 @@ def normalize_features(df: pd.DataFrame, feature_cols: list,
             rs = df[col].rolling(window, min_periods=1).std().replace(0, 1)
             df[f'{col}_norm'] = (df[col] - rm) / rs
 
-    # Bounded features
+    # Bounded / clipped features
     if 'rsi' in df.columns:
-        df['rsi_norm'] = df['rsi'] / 100.0
+        df['rsi_norm'] = df['rsi'].clip(0, 100) / 100.0
+    if 'adx' in df.columns:
+        df['adx_norm'] = df['adx'].clip(0, 100) / 100.0
     if 'volume_ratio' in df.columns:
         df['volume_ratio_norm'] = df['volume_ratio'].clip(0, 5) / 5.0
     if 'bb_width' in df.columns:
         df['bb_width_norm'] = df['bb_width'].clip(0, 0.3) / 0.3
 
+    # Drop the initial normalisation warm-up window (same behaviour as before).
     df = df.iloc[window:].reset_index(drop=True)
     return df

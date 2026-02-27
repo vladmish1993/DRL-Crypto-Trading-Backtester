@@ -41,6 +41,7 @@ class CryptoFuturesEnv(gym.Env):
             min_hold_steps: int = 0,  # 0 = disabled, e.g. 16 = 4h on 15m bars
             cooldown_steps: int = 0,  # 0 = disabled, bars to wait after a trade
             trade_penalty: float = 0.0,  # reward penalty per trade (fraction of initial_balance)
+            adx_threshold: float = 0.0,  # 0=disabled; if >0, only open new trades when ADX <= threshold
     ):
         super().__init__()
         self.df = df.reset_index(drop=True)
@@ -54,6 +55,7 @@ class CryptoFuturesEnv(gym.Env):
         self.min_hold_steps = int(min_hold_steps)
         self.cooldown_steps = int(cooldown_steps)
         self.trade_penalty = float(trade_penalty)
+        self.adx_threshold = float(adx_threshold)
         self.cooldown = 0
 
         self.action_space = spaces.Discrete(4)
@@ -215,6 +217,18 @@ class CryptoFuturesEnv(gym.Env):
         can_close = (not self.position) or (hold_steps >= self.min_hold_steps)
         can_trade = (self.cooldown == 0) and (not sl_tp_closed)
 
+        # Optional regime gate: if enabled, only OPEN trades when ADX is below threshold.
+        # Closing is always allowed (subject to min_hold/cooldown).
+        regime_ok = True
+        if self.adx_threshold and self.adx_threshold > 0:
+            adx_val = self.df.iloc[self.step_idx].get('adx', None)
+            try:
+                adx_val = float(adx_val) if adx_val is not None else float('nan')
+            except Exception:
+                adx_val = float('nan')
+            if np.isfinite(adx_val) and adx_val > self.adx_threshold:
+                regime_ok = False
+
         # execute (with anti-churn gates)
         if action == self.LONG and self.position <= 0 and can_trade:
             if self.position == -1:
@@ -222,7 +236,7 @@ class CryptoFuturesEnv(gym.Env):
                     self._close(); trades_this_step += 1
                 else:
                     action = self.HOLD
-            if self.position == 0:
+            if self.position == 0 and regime_ok:
                 self._open(+1); trades_this_step += 1
                 self.cooldown = self.cooldown_steps
 
@@ -232,7 +246,7 @@ class CryptoFuturesEnv(gym.Env):
                     self._close(); trades_this_step += 1
                 else:
                     action = self.HOLD
-            if self.position == 0:
+            if self.position == 0 and regime_ok:
                 self._open(-1); trades_this_step += 1
                 self.cooldown = self.cooldown_steps
 

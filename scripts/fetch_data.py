@@ -14,7 +14,7 @@ import argparse
 from datetime import datetime
 
 
-def fetch_binance_futures(symbol='SOL/USDT', timeframe='1m',
+def fetch_binance_futures(symbol='SOL/USDT', timeframe='15m',
                           start_date='2023-06-01', end_date=None,
                           output_dir='data'):
     """

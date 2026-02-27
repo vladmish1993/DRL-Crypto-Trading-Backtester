@@ -48,7 +48,7 @@ FIXED = dict(
     max_pos=0.10,
     sl=0.02,
     tp=0.07,
-    log_every=300,
+    log_every=30,
     no_public_copy=True,
 )
 

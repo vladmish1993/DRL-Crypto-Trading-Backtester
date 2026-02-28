@@ -23,7 +23,10 @@ yarn-error.log*
 # env files
 .env*
 *.csv
-.pyc*
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
 
 # vercel
 .vercel

@@ -39,6 +39,8 @@ import numpy as np
 import pandas as pd
 
 # allow imports from scripts/
+import torch
+
 sys.path.insert(0, os.path.dirname(__file__))
 
 from indicators import add_indicators, normalize_features
@@ -167,6 +169,32 @@ def main():
     ap.add_argument('--title', type=str, default=None)
 
     args = ap.parse_args()
+
+    # ── Auto-match FEATURES/state_dim to the checkpoint ─────────────
+    # This prevents: size mismatch (e.g. checkpoint expects 17, code builds 18)
+    algo_candidates = [args.algo] if args.algo != 'all' else ['dqn', 'double_dqn', 'dueling_dqn', 'a2c']
+
+    ckpt_path = None
+    for a in algo_candidates:
+        p = os.path.join(args.model_dir, f"{a}_{args.model_tag}.pt")
+        if os.path.exists(p):
+            ckpt_path = p
+            break
+
+    if ckpt_path:
+        ck = torch.load(ckpt_path, map_location="cpu")
+        # DQN-style checkpoints have ck['q'] with layer key 'net.0.weight'
+        if isinstance(ck, dict) and 'q' in ck and isinstance(ck['q'], dict) and 'net.0.weight' in ck['q']:
+            ck_state_dim = ck['q']['net.0.weight'].shape[1]  # e.g. 17
+            ck_feat_dim = int(ck_state_dim) - 3              # env adds 3 extra state vars
+            if ck_feat_dim != len(FEATURES):
+                print(f"Checkpoint expects {ck_state_dim=} -> {ck_feat_dim=} features, "
+                      f"but code has {len(FEATURES)}. Trimming FEATURES.")
+                FEATURES[:] = FEATURES[:ck_feat_dim]
+        else:
+            print(f"NOTE: couldn't infer state_dim from checkpoint {ckpt_path} (non-DQN or different format).")
+    else:
+        print("NOTE: no checkpoint file found to infer feature size; using FEATURES as-is.")
 
     # ── Load data ─────────────────────────────────────────────────
     df_eval = load_split(args.data, args.split, args.train_ratio, args.val_ratio)

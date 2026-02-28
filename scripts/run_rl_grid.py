@@ -32,7 +32,7 @@ GRID = dict(
     min_hold=[16, 32, 64],
     cooldown=[0, 4],
     adx_threshold=[0, 28],
-    window=[4000, 8000],
+    window=[2000, 4000, 8000],
     seed=[42, 123, 456],
 )
 
@@ -41,7 +41,7 @@ FIXED = dict(
     data="data/SOL_USDT_15m.csv",
     train_ratio=0.8,
     val_ratio=0.0,
-    eval="test",
+    eval="full",
     episodes=300,
     algo="dqn",
     fee=0.0004,

@@ -123,8 +123,7 @@ def atomic_append_rows(csv_path: str, rows: List[Dict], columns: List[str]) -> N
     df = df[columns + extra]
 
     tmp = out.with_suffix(out.suffix + '.tmp')
-    df.to_csv(tmp, index=False)
-    os.replace(tmp, out)
+    df.to_csv(out, index=False)
 
 
 def build_row(

@@ -319,6 +319,9 @@ def main():
 
     rows: List[Dict] = []
 
+    # If scanning models with --out_csv, write one row per model (crash-safe)
+    stream_write = bool(args.scan_models and args.out_csv)
+
     if args.scan_models:
         model_dir = Path(args.model_dir)
         pts = sorted(model_dir.glob("*.pt"))
@@ -333,6 +336,13 @@ def main():
                 continue
             r = eval_one(p, algo, tag)
             rows.append(r)
+
+            if args.out_csv:
+                ensure_out_dir(args.out_csv)
+                out_path = Path(args.out_csv)
+                write_header = not out_path.exists()
+                pd.DataFrame([r]).to_csv(out_path, mode="a", header=write_header, index=False)
+
             if r.get("ok"):
                 print(f"[OK]  {p.name}  trades={r.get('total_trades')}  return={r.get('total_return')}%  profit={r.get('profit_abs')}")
             else:
@@ -360,7 +370,7 @@ def main():
             else:
                 print(f"{algo}: FAIL {r.get('error')}")
 
-    if args.out_csv:
+    if args.out_csv and not stream_write:
         ensure_out_dir(args.out_csv)
         df_out = pd.DataFrame(rows)
         # append if exists

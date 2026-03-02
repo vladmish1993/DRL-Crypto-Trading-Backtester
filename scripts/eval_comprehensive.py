@@ -223,7 +223,15 @@ def _atomic_replace_write_csv(df: pd.DataFrame, out_csv: str):
     ensure_parent_dir(out_csv)
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
     df.to_csv(tmp_path, index=False)
-    os.replace(tmp_path, out_path)
+    try:
+        os.replace(tmp_path, out_path)
+    except PermissionError:
+        # Windows fallback: direct write
+        df.to_csv(out_path, index=False)
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
 
 
 def atomic_append_rows(out_csv: str, new_rows: List[Dict]):
@@ -268,6 +276,7 @@ def load_done_keys_sweep(sweep_csv: str) -> set:
         df = pd.read_csv(p, usecols=cols)
     except Exception:
         return set()
+
     # normalise types for consistent hashing
     def _t(r):
         return (
@@ -279,6 +288,7 @@ def load_done_keys_sweep(sweep_csv: str) -> set:
             float(r['infer_sl']),
             float(r['infer_tp']),
         )
+
     return set(_t(r) for _, r in df.iterrows())
 
 
@@ -289,9 +299,9 @@ def step1_eval_all(model_dir: str, df_full: pd.DataFrame, train_ratio: float,
     """Evaluate every .pt model on both test and full splits (incremental + atomic persistence)."""
     models_dir = Path(model_dir)
     pts = sorted(models_dir.glob('*.pt'))
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"  STEP 1: Evaluating {len(pts)} models on test + full splits")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     df_test = get_split(df_full, 'test', train_ratio)
 
@@ -302,6 +312,7 @@ def step1_eval_all(model_dir: str, df_full: pd.DataFrame, train_ratio: float,
     buffer: List[Dict] = []
     rows_total = 0
 
+    t_start = time.time()
     for idx, p in enumerate(pts, 1):
         algo, tag = parse_algo_and_tag(p.name)
         if algo not in ('dqn', 'double_dqn', 'dueling_dqn', 'a2c'):
@@ -381,8 +392,13 @@ def step1_eval_all(model_dir: str, df_full: pd.DataFrame, train_ratio: float,
                 atomic_append_rows(out_csv, buffer)
                 buffer.clear()
 
-        if idx % 20 == 0 or idx == len(pts):
-            print(f"  [{idx}/{len(pts)}] scanned (rows_written={rows_total})")
+        if idx % 5 == 0 or idx == len(pts):
+            elapsed = time.time() - t_start
+            avg = elapsed / idx
+            remaining = (len(pts) - idx) * avg
+            eta_min = remaining / 60
+            print(f"  [{idx}/{len(pts)}] {algo} / {tag[:50]}  "
+                  f"({elapsed / 60:.1f}m elapsed, ETA {eta_min:.1f}m)")
 
     if buffer:
         atomic_append_rows(out_csv, buffer)
@@ -397,9 +413,9 @@ def step1_eval_all(model_dir: str, df_full: pd.DataFrame, train_ratio: float,
 
 def step2_find_dual_positive(df_eval: pd.DataFrame, min_trades: int = 30) -> pd.DataFrame:
     """Find models with positive Sharpe on both test and full, with enough trades."""
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"  STEP 2: Finding models positive on both test + full (trades >= {min_trades})")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     test = df_eval[(df_eval.split == 'test') & (df_eval.trades >= min_trades)].copy()
     full = df_eval[(df_eval.split == 'full') & (df_eval.trades >= min_trades)].copy()
@@ -423,8 +439,9 @@ def step2_find_dual_positive(df_eval: pd.DataFrame, min_trades: int = 30) -> pd.
     print(f"  Positive on BOTH: {len(both_pos)}")
 
     if len(both_pos) > 0:
-        print(f"\n  {'Rank':<5} {'Test':>7} {'Full':>7} {'TestRet':>8} {'FullRet':>8} {'TestDD':>6} {'FullDD':>6} {'Trades':>6}  Tag")
-        print(f"  {'-'*85}")
+        print(
+            f"\n  {'Rank':<5} {'Test':>7} {'Full':>7} {'TestRet':>8} {'FullRet':>8} {'TestDD':>6} {'FullDD':>6} {'Trades':>6}  Tag")
+        print(f"  {'-' * 85}")
         for i, (_, r) in enumerate(both_pos.head(20).iterrows(), 1):
             print(f"  {i:<5} {r.sharpe_test:>+7.2f} {r.sharpe_full:>+7.2f} "
                   f"{r.total_return_test:>+8.2f} {r.total_return_full:>+8.2f} "
@@ -440,9 +457,9 @@ def step3_inference_sweep(model_dir: str, df_full: pd.DataFrame, train_ratio: fl
                           top_tags: list, out_csv: str, flush_every: int = 1,
                           resume: bool = True) -> pd.DataFrame:
     """Sweep inference params on top models (incremental + atomic persistence)."""
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"  STEP 3: Inference param sweep on {len(top_tags)} top models")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     sweep_min_holds = [8, 16, 32, 55]
     sweep_cooldowns = [0, 2, 4]
@@ -575,9 +592,9 @@ def step3_inference_sweep(model_dir: str, df_full: pd.DataFrame, train_ratio: fl
 
 def step4_print_results(step1_csv: str, sweep_csv: str, min_trades: int = 30):
     """Print final leaderboards."""
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"  STEP 4: FINAL RESULTS")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     if os.path.exists(step1_csv):
         df1 = pd.read_csv(step1_csv)
@@ -586,7 +603,8 @@ def step4_print_results(step1_csv: str, sweep_csv: str, min_trades: int = 30):
         print(f"\n  --- TOP 20 TEST (trades >= {min_trades}) ---")
         print(f"  {'Rank':<5} {'Sharpe':>7} {'Ret%':>8} {'DD%':>6} {'Trades':>6} {'WR%':>5}  Tag")
         for i, (_, r) in enumerate(test_df.head(20).iterrows(), 1):
-            print(f"  {i:<5} {r.sharpe:>+7.2f} {r.total_return:>+8.2f} {r.max_dd:>5.1f}% {int(r.trades):>6} {r.win_rate:>5.1f}  {r.model_tag}")
+            print(
+                f"  {i:<5} {r.sharpe:>+7.2f} {r.total_return:>+8.2f} {r.max_dd:>5.1f}% {int(r.trades):>6} {r.win_rate:>5.1f}  {r.model_tag}")
 
         pos_rate = (test_df.sharpe > 0).mean() * 100 if len(test_df) else 0
         print(f"\n  Positive Sharpe: {(test_df.sharpe > 0).sum()}/{len(test_df)} ({pos_rate:.0f}%)")
@@ -596,7 +614,8 @@ def step4_print_results(step1_csv: str, sweep_csv: str, min_trades: int = 30):
         df3 = df3[df3.trades >= min_trades].sort_values('sharpe', ascending=False)
 
         print(f"\n  --- TOP 20 INFERENCE SWEEP (test, trades >= {min_trades}) ---")
-        print(f"  {'Rank':<5} {'Sharpe':>7} {'Ret%':>8} {'DD%':>6} {'Trades':>6} {'MH':>4} {'CD':>3} {'MP':>5} {'Pen':>6} {'SL':>5} {'TP':>5}  Tag")
+        print(
+            f"  {'Rank':<5} {'Sharpe':>7} {'Ret%':>8} {'DD%':>6} {'Trades':>6} {'MH':>4} {'CD':>3} {'MP':>5} {'Pen':>6} {'SL':>5} {'TP':>5}  Tag")
         for i, (_, r) in enumerate(df3.head(20).iterrows(), 1):
             print(f"  {i:<5} {r.sharpe:>+7.2f} {r.total_return:>+8.2f} {r.max_dd:>5.1f}% "
                   f"{int(r.trades):>6} {int(r.infer_min_hold):>4} {int(r.infer_cooldown):>3} "

@@ -461,12 +461,12 @@ def step3_inference_sweep(model_dir: str, df_full: pd.DataFrame, train_ratio: fl
     print(f"  STEP 3: Inference param sweep on {len(top_tags)} top models")
     print(f"{'=' * 80}")
 
-    sweep_min_holds = [8, 16, 32, 55]
+    sweep_min_holds = [32, 55]
     sweep_cooldowns = [0, 2, 4]
-    sweep_max_pos = [0.05, 0.10, 0.15]
-    sweep_penalties = [0.0, 0.0001, 0.0002]
-    sweep_sls = [0.0, 0.01, 0.02, 0.03, 0.05]
-    sweep_tps = [0.0, 0.03, 0.05, 0.07, 0.10, 0.15, 0.2]
+    sweep_max_pos = [0.10]
+    sweep_penalties = [0.0]
+    sweep_sls = [0.0, 0.02]
+    sweep_tps = [0.07, 0.10, 0.20]
 
     df_test = get_split(df_full, 'test', train_ratio)
 
@@ -678,7 +678,7 @@ def main():
         df_eval = None
 
     # Step 2
-    if df_eval is not None and (run_all or args.step == 2):
+    if df_eval is not None and (run_all or args.step in (2, 3)):
         both_pos = step2_find_dual_positive(df_eval, min_trades=args.min_trades)
     else:
         both_pos = None

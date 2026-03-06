@@ -33,7 +33,7 @@ python scripts/fetch_data.py --symbol SOL/USDT --timeframe 15m --start 2023-06-0
 python scripts/generate_sample_data.py
 
 # 3. Train all 4 models + run backtests
-python scripts/train_all.py --episodes 50
+python scripts/train_all_window.py --episodes 50
 
 # 4. Launch the dashboard
 pnpm dev
@@ -79,7 +79,7 @@ The `CryptoFuturesEnv` implements a realistic futures trading simulation:
 
 ## Configuration
 
-Edit hyperparameters in `scripts/train_all.py`:
+Edit hyperparameters in `scripts/train_all_window.py`:
 
 ```python
 hp = dict(

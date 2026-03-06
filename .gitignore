@@ -6,8 +6,8 @@
 # next.js
 /.next/
 /out/
-models/
 old_models/
+models/
 results/
 .idea/
 
@@ -27,6 +27,7 @@ yarn-error.log*
 __pycache__/
 *.pyc
 *.pyo
+*.pt
 
 # vercel
 .vercel

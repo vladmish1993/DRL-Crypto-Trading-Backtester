@@ -29,6 +29,8 @@ __pycache__/
 *.pyo
 *.pt
 
+.json
+
 # vercel
 .vercel
 
